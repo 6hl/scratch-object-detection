@@ -23,7 +23,7 @@ python3 train.py --batch-size 16 --epochs 100 --model rcnn --data dataset.yaml
 ## Requirements
 Developed in python 3.8
 ```
-git clone 
+git clone https://github.com/6hl/scratch-object-detection.git
 cd scratch-object-detection
 pip install -r requirements.txt
 ```
