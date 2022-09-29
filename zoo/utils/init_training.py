@@ -1,4 +1,4 @@
-from zoo.models.rcnn import rcnn
+from zoo.models import rcnn
 
 MODELS = {
     "rcnn": rcnn.RCNN
