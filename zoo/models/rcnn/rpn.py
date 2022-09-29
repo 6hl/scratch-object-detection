@@ -14,13 +14,13 @@ import pandas as pd
 
 from zoo.utils.data import Data
 
-class _RegionProposalNetwork(Data):
-    def __init__(self, force_data=False, *args, **kwargs):
+class RegionProposalNetwork(Data):
+    def __init__(self, force_data=False, dynamic=False, transform=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.n_counter = 50
-        file_id = "train" if self.train else "test"
-        self.region_csv_path = os.path.join(self.data["path"], f"rpn_{file_id}.csv")
-        if not os.path.exists(self.region_csv_path) or force_data:
+        self.n_counter = 10
+        self.transform = transform
+        self.region_csv_path = os.path.join(self.data["path"], f"rpn_{self.name}.csv")
+        if (not os.path.exists(self.region_csv_path) or force_data) and not dynamic:
             self._make_region_csv()
         self.region_csv = pd.read_csv(self.region_csv_path, sep="\t", header=None, converters={1:ast.literal_eval})
 
@@ -45,9 +45,9 @@ class _RegionProposalNetwork(Data):
         """
         self.init = True
         region_csv = pd.DataFrame(columns=["image_name", "box", "target"])
-        for idx, img_name in enumerate(tqdm(self.intersection_path, desc="Generating region CSV")):
-            img = cv2.imread(os.path.join(self.train_img_path, f"{img_name}.jpg"))
-            yolo_labels = torch.from_numpy(np.loadtxt(os.path.join(self.train_labels_path, f"{img_name}.txt"))).reshape((-1,5)).to(self.device) # x_c, y_c, w, h -> xyxy
+        for idx, img_name in enumerate(tqdm(self.intersection_path, desc=f"Generating {self.name} region CSV")):
+            img = cv2.imread(os.path.join(self.img_path, f"{img_name}.jpg"))
+            yolo_labels = torch.from_numpy(np.loadtxt(os.path.join(self.labels_path, f"{img_name}.txt"))).reshape((-1,5)).to(self.device) # x_c, y_c, w, h -> xyxy
             if yolo_labels == []:
                 continue
             search_results = self.coco_to_voc(torch.from_numpy(self._selective_search(img, False)).to(self.device)) # x, y, w, h -> xyxy
@@ -69,15 +69,23 @@ class _RegionProposalNetwork(Data):
                     }
                    )
                 ))
+            if idx == self.n_counter:
+                break
         region_csv.to_csv(self.region_csv_path, sep="\t",index=False, header=False)
 
     def get_region(self):
         # TODO: Make dynamic region selector for runtime (this will cause performance issues)
         pass
 
+    def __len__(self):
+        return len(self.region_csv.index)
+
     def __getitem__(self, idx):
-        # filename, box, label, name
         sample = self.region_csv.iloc[idx]
         bbx = sample[1]
-        image = cv2.imread(os.path.join(self.img_path, f"{sample[0]}.jpg"))[bbx[1]:bbx[3], bbx[0]:bbx[2]]
-        return image, sample[2]
+        target = np.asarray(sample[2])
+        img = cv2.imread(os.path.join(self.img_path, f"{sample[0]}.jpg"))[bbx[1]:bbx[3], bbx[0]:bbx[2]]
+        img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, torch.from_numpy(target)
