@@ -1,6 +1,6 @@
 # Object Detection Models Implemented from Scratch
 
-## For training a model on a custon dataset
+## For training a model on a custom dataset
 Ensure dataset is in yolo format and add your dataset to `scratch-object-detection/datasets`
 
 ```
