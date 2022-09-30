@@ -3,13 +3,13 @@ import os
 
 import cv2
 import numpy as np
-import torchvision
-from torchvision.transforms import transforms
-from torch import nn
-from torchvision.ops import box_iou
-from tqdm import tqdm
 import pandas as pd
 import torch
+from torch import nn
+import torchvision
+from torchvision.ops import box_iou
+from torchvision.transforms import transforms
+from tqdm import tqdm
 
 from zoo.utils.logger import Logger
 from zoo.utils.data import Data
@@ -45,7 +45,7 @@ class _RPN(Data):
         """
         self.init = True
         region_csv = pd.DataFrame(columns=["image_name", "box", "target"])
-        for idx, img_name in enumerate(tqdm(self.intersection_path, desc=f"Generating {self.name} region CSV")):
+        for idx, img_name in enumerate(tqdm(self.intersection_data, desc=f"Generating {self.name} region CSV")):
             img = cv2.imread(os.path.join(self.img_path, f"{img_name}.jpg"))
             yolo_labels = torch.from_numpy(np.loadtxt(os.path.join(self.labels_path, f"{img_name}.txt"))).reshape((-1,5)).to(self.device) # x_c, y_c, w, h -> xyxy
             if yolo_labels == []:
