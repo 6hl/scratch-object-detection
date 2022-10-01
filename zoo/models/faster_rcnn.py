@@ -12,12 +12,16 @@ class FasterRCNN(nn.Module):
         **kargs
     ):
         super().__init__()
+        n_anchors = 9
         self._feature_extractor = Backbone(pretrained=True)
         self._rpn = RPN()
-    
+        self._rcnn = RCNN()
+        
     def forward(self, image_list, bbx, targets):
-        x = self._feature_extractor(image_list)
-        x = self._rpn(image_list, x)
+        # RPN returns: 
+        features = self._feature_extractor(image_list)
+        proposals, proposal_losses = self._rpn(image_list, features, bbx, targets)
+        # detections, detection_losses = self._rcnn(features, proposals)
         pass
     
 class Backbone(nn.Module):
@@ -48,88 +52,128 @@ class Backbone(nn.Module):
 class RPN(nn.Module):
     def __init__(self):
         super().__init__()
-        n_anchors = 9
         # TODO: Init weights?
+        n_anchors = 9
+        self.anchor = Anchor(n_anchors)
         self._conv = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3,3), stride=1, padding="same")
         self._score = nn.Conv2d(in_channels=512, out_channels=n_anchors, kernel_size=(1,1), stride=1, padding="same")
         self._bbx = nn.Conv2d(in_channels=512, out_channels=n_anchors*4, kernel_size=(1,1), stride=1, padding="same")
-        self.anchor_generator = Anchor(n_anchors)
-    
-    def forward(self, image_list, features):
-        pass
 
-class ROI(nn.Module):
-    def __init__(self):
-        super().__init__()
-        pass
+    def forward(self, images, features, bbx, truth_targets):
+        # TODO: Check non-linearity
+        x = F.relu(self._conv(features))
+        score = F.softmax(self._score(x), 1)
+        proposal = self._bbx(x)
+        anchors = self.anchor.generate_anchor_mesh(images, features)
+        anch_targets = self.anchor.gen_anchor_targets(anchors, bbx)
 
-class Anchor(nn.Module):
-    def __init__(self, n_anchors=9, anchor_ratios=[0.5, 1, 2], scales=[3,6,12]):
-        super().__init__()
+        # TODO: calculate loss functions
+        return proposal, score
+        
+class Anchor:
+    def __init__(self, n_anchors=9, anchor_ratios=[0.5, 1, 2], scales=[8, 16, 32]):
         self.n_anchors = torch.tensor(n_anchors)
         self.anchor_ratios = torch.tensor(anchor_ratios)
+        # (8,16,32), (3,6,12)
         self.scales = torch.tensor(scales)
+        self.border = 0
     
-    def _generate_anchor_ratios(self, base_anchor, ratios):
+    def _ratio_anchors(self, base_anchor, ratios):
+        """Helper function to generate ratio anchors
+        Args:
+            base_anchor (torch.Tensor): initial anchor location
+            ratios (torch.Tensor): ratios for anchors
+        Returns:
+            torch.Tensor: bounding boxes (len(ratios), 4)
+        """
         yolo_anchor = self._voc_to_yolo(base_anchor)
         wr = torch.round(torch.sqrt(yolo_anchor[2]*yolo_anchor[3]/ratios))
         hr = torch.round(wr*ratios)
-        return self._gen_anchor_set(
+        return self._anchor_set(
             [
                 yolo_anchor[0],
                 yolo_anchor[1],
-                hr,
-                wr
+                wr,
+                hr
             ]
         )
     
-    def _gen_anchor_set(self, yolo_anchor):
+    def _anchor_set(self, yolo_anchor):
+        """Helper function to generate anchors
+        Args:
+            yolo_anchor (torch.Tensor): (x_center, y_center, width, height)
+        Returns:
+            torch.Tensor: (n,4) set of (x1,y1,x2,y2) cords
+        """
         return torch.stack(
             (
-                yolo_anchor[0] - 0.5 * (yolo_anchor[3]-1),
-                yolo_anchor[1] - 0.5 * (yolo_anchor[2]-1),
-                yolo_anchor[0] + 0.5 * (yolo_anchor[3]-1),
-                yolo_anchor[1] + 0.5 * (yolo_anchor[2]-1),
+                yolo_anchor[0] - 0.5 * (yolo_anchor[2]-1),
+                yolo_anchor[1] - 0.5 * (yolo_anchor[3]-1),
+                yolo_anchor[0] + 0.5 * (yolo_anchor[2]-1),
+                yolo_anchor[1] + 0.5 * (yolo_anchor[3]-1),
             ), 
             dim=1
         ) 
 
-    def _voc_to_yolo(self, box):
+    # TODO: Remove for torch.ops.box_convert
+    def _voc_to_yolo(self, bbx):
         """Helper function that returns yolo labeling for bounding box
         Args:
-            box (list): x_center, y_center, height, width
+            bbx (list): [x1, y1, x2, y2]
+        Returns:
+            torch.Tensor: (x_center, y_center, width, height)
         """
         return torch.tensor(
             (
-                box[0] + 0.5*(box[3]-1), 
-                box[1] + 0.5*(box[2]-1), 
-                box[2] - box[0] + 1, 
-                box[3] - box[1] + 1
+                bbx[0] + 0.5*(bbx[3]-1), 
+                bbx[1] + 0.5*(bbx[2]-1), 
+                bbx[3] - bbx[1] + 1,
+                bbx[2] - bbx[0] + 1
             )
         )
 
-    def _scale_anchor_ratios(self, anchor, scales):
+    def _scale_ratio_anchors(self, anchor, scales):
+        """Helper function to scale the ratio anchors
+        Args:
+            anchor (torch.Tensor): (x_center, y_center, width, height)
+            scales (torch.Tensor): scales for anchors
+        """
         yolo_anchor = self._voc_to_yolo(anchor)
-        ws = yolo_anchor[3] * scales
-        hs = yolo_anchor[2] * scales
-        return self._gen_anchor_set([yolo_anchor[0], yolo_anchor[1], hs, ws])
+        return self._anchor_set(
+            [
+                yolo_anchor[0], 
+                yolo_anchor[1], 
+                yolo_anchor[2] * scales, 
+                yolo_anchor[3] * scales
+            ]
+        )
 
     def generate_anchor_mesh(self, images, feature_maps):
+        """Function generates anchor maps for given image and feature maps
+        Args:   
+            images (torch.Tensor): input image
+            feature_maps (torch.Tensor): backbone feature maps
+        Returns:
+            torch.Tensor: (feature_maps*anchors, 4)
+        """
         h_img, w_img = images.shape[2], images.shape[3]
         h_fmap, w_fmap = feature_maps.shape[2], feature_maps.shape[3]
         n_fmap = h_fmap*w_fmap
 
         # TODO: Adjust for batchsize > 1
         h_stride, w_stride = h_img/h_fmap, w_img/h_fmap
-        base_anchor_local = torch.tensor([0, 0, h_stride-1, w_stride-1])
-        ratio_anchors_local = self._generate_anchor_ratios(base_anchor_local, self.anchor_ratios)
+        base_anchor_local = torch.tensor([0, 0, w_stride-1, h_stride-1])
+        ratio_anchors_local = self._ratio_anchors(base_anchor_local, self.anchor_ratios)
         local_anchors = torch.stack([
-            self._scale_anchor_ratios(ratio_anchors_local[i,:], self.scales) for i in range(ratio_anchors_local.shape[0])
+            self._scale_ratio_anchors(ratio_anchors_local[i,:], self.scales) for i in range(ratio_anchors_local.shape[0])
         ], dim=0).reshape(1, -1, 4)
         mesh_x, mesh_y = torch.meshgrid(
-            (torch.arange(0, w_fmap) * w_stride,
-            torch.arange(0, h_fmap) * h_stride),
-        indexing="xy")
+            (
+                torch.arange(0, w_fmap) * w_stride,
+                torch.arange(0, h_fmap) * h_stride
+            ),
+            indexing="xy"
+        )
         anchor_shifts = torch.stack(
             (
                 mesh_x.flatten(),
@@ -140,8 +184,17 @@ class Anchor(nn.Module):
             dim=0
         ).transpose(0,1).reshape(1, n_fmap, 4).view(-1, 1, 4)
 
-        return (local_anchors + anchor_shifts).reshape(-1,4)
+        anchor_mesh = (local_anchors + anchor_shifts).reshape(-1,4)
+        return torchvision.ops.clip_boxes_to_image(anchor_mesh, (h_img, w_img))
+        
+    def gen_anchor_targets(self, anchors, truth_targets):
+        # TODO: Acquire targets within threshold for fg and bg
+        anchor_iou = torchvision.ops.box_iou(truth_targets.reshape(-1,4), anchors)
 
-    def forward(self, images, feature_maps):
-        # TODO: Adjust for batch size of images
-        return self.generate_anchor_mesh(images, feature_maps)
+class RCNN(nn.Module):
+    # TODO: setup rcnn model
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, features, proposals):
+        pass
