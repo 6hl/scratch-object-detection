@@ -1,10 +1,9 @@
+from multiprocessing import pool
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torchvision
 import numpy as np
-
-from zoo.utils.loss_functions import smooth_l1_loss
 
 class FasterRCNN(nn.Module):
     def __init__(self,
@@ -15,16 +14,19 @@ class FasterRCNN(nn.Module):
     ):
         super().__init__()
         n_anchors = 9
+        # TODO: Adjust for different backbone models
+        # TODO: adjust for different anchor sizes and shapes
         self._feature_extractor = Backbone(pretrained=True)
         self._rpn = RPN()
         self._rcnn = RCNN()
         
     def forward(self, image_list, bbx, targets):
-        # RPN returns: 
         features = self._feature_extractor(image_list)
-        rpn_out, rpn_losses = self._rpn(image_list, features, bbx, targets)
-        # detections, detection_losses = self._rcnn(features, proposals)
-    
+        rpn_out, rpn_bx_loss, rpn_target_loss = self._rpn(image_list, features, bbx, targets)
+        roi_bx_loss, roi_target_loss = self._rcnn(features, rpn_out[1], rpn_out[2])
+        return rpn_bx_loss, rpn_target_loss, roi_bx_loss, roi_target_loss
+
+
 class Backbone(nn.Module):
     def __init__(self, pretrained=True, fpn=False):
         super().__init__()
@@ -35,10 +37,6 @@ class Backbone(nn.Module):
                 param.requires_grad = False
         else:
             self._feat = torchvision.models.vgg16(weights=None).features[:30]
-        if self.fpn:
-            # TODO: Implement fpn in_list
-            in_list = []
-            self._feat_pyr = torchvision.ops.FeaturePyramidNetwork(in_list, 256)
     
     def forward(self, x):
         """ Class is feature extractor backbone using vgg16
@@ -46,8 +44,6 @@ class Backbone(nn.Module):
             x (torch.Tensor): input image
         """
         x = self._layers(x)
-        if self.fpn:
-            x = self._feat_pyr(x)
         return x
 
 
@@ -60,39 +56,42 @@ class RPN(nn.Module):
         self.rpn_batch_size = 256
         self.anchor = Anchor(n_anchors)
         self._conv = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3,3), stride=1, padding="same")
-        self._score = nn.Conv2d(in_channels=512, out_channels=n_anchors*2, kernel_size=(1,1), stride=1, padding=0)
+        self._target = nn.Conv2d(in_channels=512, out_channels=n_anchors*2, kernel_size=(1,1), stride=1, padding=0)
         self._bbx = nn.Conv2d(in_channels=512, out_channels=n_anchors*4, kernel_size=(1,1), stride=1, padding=0)
 
     def forward(self, images, features, bbx, truth_targets):
-        # TODO: Check non-linearity
         x = F.relu(self._conv(features))
-        scores = self._score(x).permute(0, 2, 3, 1).contiguous()
-
+        scores = self._target(x).permute(0, 2, 3, 1).contiguous()
         # Scores: (batch_size, feature_size, 2)
         # Proposal Boxes: (batch_size, feature_size, 4)
-        scores = F.softmax(scores.view(1, 40, 40, 9, 2), dim=4).view(features.shape[0], -1, 2)
+        scores = F.softmax(scores.view(features.shape[0], -1, 2), dim=2)
+        print(scores)
         proposals = self._bbx(x).permute(0,2,3,1).contiguous().view(features.shape[0],-1,4)
 
-        # TODO: Combine mesh and target generator
         anchors, anchor_targets = self.anchor.generate_anchor_mesh(
             images, 
             features, 
             bbx, 
             self.rpn_batch_size
         )
-        # anchor_targets = self.anchor.gen_anchor_targets(anchors, bbx, self.rpn_batch_size)
+        roi, roi_targets = self.anchor.post_processing(
+            anchors,
+            anchor_targets,
+            scores
+        )
 
         # TODO: Adjust for batchsize
         bx_loss = F.smooth_l1_loss(proposals[0][anchor_targets>0], anchors[anchor_targets>0])
         target_loss = F.cross_entropy(scores[0], anchor_targets, ignore_index=-1)
-        return (proposals, anchors, anchor_targets), (bx_loss, target_loss)
+        return (proposals, roi, roi_targets), bx_loss, target_loss
 
 
 class Anchor:
-    def __init__(self, n_anchors=9, anchor_ratios=[0.5, 1, 2], scales=[8, 16, 32]):
+    def __init__(self, n_anchors=9, anchor_ratios=[0.5, 1, 2], scales=[8, 16, 32], anchor_threshold=[0.5, 0.1]):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.n_anchors = torch.tensor(n_anchors)
         self.anchor_ratios = torch.tensor(anchor_ratios)
-        # (8,16,32), (3,6,12)
+        self.anchor_threshold = anchor_threshold
         self.scales = torch.tensor(scales)
         self.border = 0
     
@@ -166,6 +165,7 @@ class Anchor:
             ]
         )
 
+    # TODO: Make anchor script dynamically adjust scales if needed
     def generate_anchor_mesh(self, images, feature_maps, truth_targets, rpn_batch_size):
         """Function generates anchor maps for given image and feature maps
         Args:   
@@ -207,16 +207,46 @@ class Anchor:
 
         self.anchor_iou = torchvision.ops.box_iou(truth_targets.reshape(-1,4), anchors)
         anchor_targets = torch.full((anchors.shape[0],), -1)
-        anchor_targets[self.anchor_iou[0] >= 0.7] = 1
-        anchor_targets[self.anchor_iou[0] <= 0.3] = 0
-        # nms_idx = torchvision.ops.nms(anchors, anchor_iou, iou_threshold=0.7)
+        anchor_targets[self.anchor_iou[0] >= self.anchor_threshold[0]] = 1
+        anchor_targets[self.anchor_iou[0] <= self.anchor_threshold[1]] = 0
+
         return anchors, anchor_targets
-        
+
+    def post_processing(self, anchors, targets, scores):
+        # TODO: Fix for batch size > 1
+        scores = scores.detach().view(-1, 2).max(dim=1)[0]
+        top_scores_idx = scores.argsort()[:6000]
+        top_anchors = anchors[top_scores_idx].to(torch.float64)
+        iou_scores = self.anchor_iou[0][top_scores_idx]
+        nms_idx = torchvision.ops.nms(top_anchors, iou_scores, iou_threshold=0.6)
+        return anchors[nms_idx], targets[nms_idx]
+
 
 class RCNN(nn.Module):
     # TODO: setup rcnn model
-    def __init__(self):
+    def __init__(self, pool_size=7, n_classes=1, pretrained=True):
         super().__init__()
+        self.pool_size = pool_size
+        if pretrained:
+            mod = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
+            self._layers = nn.Sequential(*[mod.classifier[i] for i in [0,1,3,4]])
+        else:
+            mod = torchvision.models.vgg16(weights=None)
+            self._layers = nn.Sequential(*[mod.classifier[i] for i in [0,1,3,4]])
+        self._target = nn.Linear(4096, n_classes+1)
+        self._bx = nn.Linear(4096, 4*n_classes)
 
-    def forward(self, features, proposals):
-        pass
+    def forward(self, features, roi, roi_targets):
+        # TODO: adjust roi for batch data list of batch rois
+        pooled_features = torchvision.ops.roi_pool(
+            features, 
+            [roi], 
+            output_size=(self.pool_size, self.pool_size)
+        )
+        pooled_features = pooled_features.view(pooled_features.shape[0], -1)
+        x = self._layers(pooled_features)
+        targets = F.softmax(self._target(x), dim=1)
+        bx = self._bx(x)
+        bx_loss = F.smooth_l1_loss(bx, roi)
+        target_loss = F.cross_entropy(targets, roi_targets, ignore_index=-1)
+        return bx_loss, target_loss
