@@ -9,7 +9,8 @@ class Logger(object):
     """Logger class used to save model states and training information
     """
     MODEL_LOG = {
-        "rcnn": ["epoch", "train_loss", "train_acc", "val_loss", "val_acc"]
+        "rcnn": ["epoch", "train_loss", "train_acc", "val_loss", "val_acc"],
+        "fasterrcnn": ["epoch", "train_loss", "train_acc", "val_loss", "val_acc"]
     }
     def __init__(self, name):
         self.field_names = Logger.MODEL_LOG[name]
