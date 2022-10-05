@@ -1,4 +1,5 @@
-from multiprocessing import pool
+from collections import namedtuple
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -6,6 +7,14 @@ import torchvision
 import numpy as np
 
 class FasterRCNN(nn.Module):
+    Loss = namedtuple("Loss",
+        [
+        "rpn_bx_loss",
+        "rpn_target_loss",
+        "roi_bx_loss",
+        "roi_target_loss"
+        ]
+    )
     def __init__(self,
         backbone=None,
         n_classes=None,
@@ -19,12 +28,81 @@ class FasterRCNN(nn.Module):
         self._feature_extractor = Backbone(pretrained=True)
         self._rpn = RPN()
         self._rcnn = RCNN()
+        n_anchors = 9
+        self.rpn_batch_size = 256
+        self.anchor = Anchor(n_anchors)
+
+    def loss_func(
+        self, 
+        anchors, 
+        anchor_targets, 
+        rpn_bx, 
+        rpn_target, 
+        roi_bx, 
+        roi_targets, 
+        roi, 
+        roi_idx
+    ):
+        """ Function computes the loss for Faster RCNN Model
+
+        Args:
+            anchors (tensor.Tensor): image created anchors
+            anchor_targets (tensor.Tensor): Generated targets from threshold
+            rpn_bx (tensor.Tensor): rpn output bounding box coordinates (N, 4) in (x1,y1,x2,y2)
+            rpn_target (tensor.Tensor): rpn target predictions in softmax format (N, C)
+            roi_bx (tensor.Tensor): rpn output bounding box coordinates (N, 4) in (x1,y1,x2,y2)
+            roi_target (tensor.Tensor): rpn target predictions in softmax format (N, C)
+            rois (tensor.Tensor): roi tensor with highest probability foreground anchors
+            roi_idx (tensor.Tensor): roi indices from anchors
+
+        Returns:
+            namedtuple: output loss tuple  with idx names:        
+                        'rpn_bx_loss',
+                        'rpn_target_loss',
+                        'roi_bx_loss',
+                        'roi_target_loss'
+            torch.Tensor: sum of losses used for backpropogation
+        """
+        # TODO: Save roi indexes so anchor_targets only can be passed
+        rpn_bx_loss = F.smooth_l1_loss(rpn_bx[0][anchor_targets>0], anchors[anchor_targets>0])
+        rpn_target_loss = F.cross_entropy(rpn_target[0], anchor_targets, ignore_index=-1)
+
+        roi_bx_loss = F.smooth_l1_loss(roi_bx, roi)
+        roi_target_loss = F.cross_entropy(roi_targets, anchor_targets[roi_idx], ignore_index=-1)
         
-    def forward(self, image_list, bbx, targets):
+        losses = [rpn_bx_loss, rpn_target_loss, roi_bx_loss, roi_target_loss]
+        return FasterRCNN.Loss(*losses), sum(losses)
+
+    def forward(self, image_list, true_bx=None, true_targets=None):
         features = self._feature_extractor(image_list)
-        rpn_out, rpn_bx_loss, rpn_target_loss = self._rpn(image_list, features, bbx, targets)
-        roi_bx_loss, roi_target_loss = self._rcnn(features, rpn_out[1], rpn_out[2])
-        return rpn_bx_loss, rpn_target_loss, roi_bx_loss, roi_target_loss
+        rpn_bxs, rpn_targets = self._rpn(image_list, features)
+        anchors = self.anchor.generate_anchor_mesh(
+            image_list, 
+            features,
+        )
+        rois, roi_idx = self.anchor.post_processing(
+            anchors,
+            rpn_targets
+        )
+        roi_bxs, roi_targets = self._rcnn(features, rois)
+
+        if self.training:
+            anchor_targets = self.anchor.generate_anchor_targets(
+                anchors,
+                true_bx
+            )
+            return self.loss_func(        
+                anchors, 
+                anchor_targets, 
+                rpn_bxs, 
+                rpn_targets, 
+                roi_bxs, 
+                roi_targets, 
+                rois,
+                roi_idx
+            )
+        else:
+            return roi_bxs, roi_targets
 
 
 class Backbone(nn.Module):
@@ -53,37 +131,20 @@ class RPN(nn.Module):
         # TODO: Init weights?
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         n_anchors = 9
-        self.rpn_batch_size = 256
-        self.anchor = Anchor(n_anchors)
+        # self.rpn_batch_size = 256
+        # self.anchor = Anchor(n_anchors)
         self._conv = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3,3), stride=1, padding="same")
         self._target = nn.Conv2d(in_channels=512, out_channels=n_anchors*2, kernel_size=(1,1), stride=1, padding=0)
         self._bbx = nn.Conv2d(in_channels=512, out_channels=n_anchors*4, kernel_size=(1,1), stride=1, padding=0)
 
-    def forward(self, images, features, bbx, truth_targets):
+    def forward(self, images, features):
         x = F.relu(self._conv(features))
-        scores = self._target(x).permute(0, 2, 3, 1).contiguous()
+        target = self._target(x).permute(0, 2, 3, 1).contiguous()
         # Scores: (batch_size, feature_size, 2)
         # Proposal Boxes: (batch_size, feature_size, 4)
-        scores = F.softmax(scores.view(features.shape[0], -1, 2), dim=2)
-        print(scores)
-        proposals = self._bbx(x).permute(0,2,3,1).contiguous().view(features.shape[0],-1,4)
-
-        anchors, anchor_targets = self.anchor.generate_anchor_mesh(
-            images, 
-            features, 
-            bbx, 
-            self.rpn_batch_size
-        )
-        roi, roi_targets = self.anchor.post_processing(
-            anchors,
-            anchor_targets,
-            scores
-        )
-
-        # TODO: Adjust for batchsize
-        bx_loss = F.smooth_l1_loss(proposals[0][anchor_targets>0], anchors[anchor_targets>0])
-        target_loss = F.cross_entropy(scores[0], anchor_targets, ignore_index=-1)
-        return (proposals, roi, roi_targets), bx_loss, target_loss
+        target = F.softmax(target.view(features.shape[0], -1, 2), dim=2)
+        bx = self._bbx(x).permute(0,2,3,1).contiguous().view(features.shape[0],-1,4)
+        return bx, target
 
 
 class Anchor:
@@ -94,6 +155,7 @@ class Anchor:
         self.anchor_threshold = anchor_threshold
         self.scales = torch.tensor(scales)
         self.border = 0
+        self.nms_filter = 2000
     
     def _ratio_anchors(self, base_anchor, ratios):
         """Helper function to generate ratio anchors
@@ -166,7 +228,7 @@ class Anchor:
         )
 
     # TODO: Make anchor script dynamically adjust scales if needed
-    def generate_anchor_mesh(self, images, feature_maps, truth_targets, rpn_batch_size):
+    def generate_anchor_mesh(self, images, feature_maps):
         """Function generates anchor maps for given image and feature maps
         Args:   
             images (torch.Tensor): input image
@@ -205,21 +267,26 @@ class Anchor:
         anchor_mesh = (local_anchors + anchor_shifts).reshape(-1,4)
         anchors = torchvision.ops.clip_boxes_to_image(anchor_mesh, (h_img, w_img))
 
-        self.anchor_iou = torchvision.ops.box_iou(truth_targets.reshape(-1,4), anchors)
+        return anchors
+    
+    def generate_anchor_targets(self, anchors, true_bx):
+        self.anchor_iou = torchvision.ops.box_iou(true_bx.reshape(-1,4), anchors)
         anchor_targets = torch.full((anchors.shape[0],), -1)
         anchor_targets[self.anchor_iou[0] >= self.anchor_threshold[0]] = 1
         anchor_targets[self.anchor_iou[0] <= self.anchor_threshold[1]] = 0
+        return anchor_targets
 
-        return anchors, anchor_targets
-
-    def post_processing(self, anchors, targets, scores):
+    def post_processing(self, anchors, scores):
         # TODO: Fix for batch size > 1
-        scores = scores.detach().view(-1, 2).max(dim=1)[0]
-        top_scores_idx = scores.argsort()[:6000]
+        # TODO: Ensure GPU support
+        scores = scores.detach().view(-1, 2)[:, 1]
+        top_scores_idx = scores.argsort()
         top_anchors = anchors[top_scores_idx].to(torch.float64)
-        iou_scores = self.anchor_iou[0][top_scores_idx]
-        nms_idx = torchvision.ops.nms(top_anchors, iou_scores, iou_threshold=0.6)
-        return anchors[nms_idx], targets[nms_idx]
+        top_scores = anchors[top_scores_idx][:, 1].to(torch.float64)
+        nms_idx = torchvision.ops.nms(top_anchors, top_scores, iou_threshold=0.6)
+        if self.nms_filter:
+            nms_idx = nms_idx[:self.nms_filter]
+        return anchors[nms_idx], nms_idx
 
 
 class RCNN(nn.Module):
@@ -233,10 +300,10 @@ class RCNN(nn.Module):
         else:
             mod = torchvision.models.vgg16(weights=None)
             self._layers = nn.Sequential(*[mod.classifier[i] for i in [0,1,3,4]])
-        self._target = nn.Linear(4096, n_classes+1)
         self._bx = nn.Linear(4096, 4*n_classes)
-
-    def forward(self, features, roi, roi_targets):
+        self._target = nn.Linear(4096, n_classes+1)
+    
+    def forward(self, features, roi):
         # TODO: adjust roi for batch data list of batch rois
         pooled_features = torchvision.ops.roi_pool(
             features, 
@@ -245,8 +312,6 @@ class RCNN(nn.Module):
         )
         pooled_features = pooled_features.view(pooled_features.shape[0], -1)
         x = self._layers(pooled_features)
-        targets = F.softmax(self._target(x), dim=1)
         bx = self._bx(x)
-        bx_loss = F.smooth_l1_loss(bx, roi)
-        target_loss = F.cross_entropy(targets, roi_targets, ignore_index=-1)
-        return bx_loss, target_loss
+        targets = F.softmax(self._target(x), dim=1)
+        return bx, targets
