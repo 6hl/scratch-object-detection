@@ -4,15 +4,38 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torchvision
-import numpy as np
 
 class FasterRCNN(nn.Module):
+    """ Function implements Faster-RCNN model from 
+        https://proceedings.neurips.cc/paper/2015/file/14bfa6bb14875e45bba028a21ed38046-Paper.pdf
+    
+    This class assumes the input data is in YOLO format 
+                    (x_center, y_center, width, height)
+    Structure:
+
+        Feature Extraction:
+            This process uses a CNN model to extract features from
+            the input data.
+
+        Region Proposal Network:
+            This network takes the features from the feature extraction
+            layer and maps the features to the image space using anchors.
+            These anchors determine regions in the image which can be classified
+            as background/foreground
+
+        Region-based CNN:
+            This network takes the highest anchor region proposals from
+            the RPN and classifies the proposal as a class or background,
+            and it determines bounding box locations for the proposals.
+    """
+
+
     Loss = namedtuple("Loss",
         [
-        "rpn_bx_loss",
-        "rpn_target_loss",
-        "roi_bx_loss",
-        "roi_target_loss"
+            "rpn_bx_loss",
+            "rpn_target_loss",
+            "roi_bx_loss",
+            "roi_target_loss"
         ]
     )
     def __init__(self,
@@ -25,9 +48,9 @@ class FasterRCNN(nn.Module):
         n_anchors = 9
         # TODO: Adjust for different backbone models
         # TODO: adjust for different anchor sizes and shapes
-        self._feature_extractor = Backbone(pretrained=True)
-        self._rpn = RPN()
-        self._rcnn = RCNN()
+        self._feature_extractor = FeatureExtractor(pretrained=True)
+        self._rpn = RegionProposalNetwork(n_classes=n_classes)
+        self._rcnn = RCNN(n_classes=n_classes)
         n_anchors = 9
         self.rpn_batch_size = 256
         self.anchor = Anchor(n_anchors)
@@ -35,12 +58,13 @@ class FasterRCNN(nn.Module):
     def loss_func(
         self, 
         anchors, 
-        anchor_targets, 
-        rpn_bx, 
-        rpn_target, 
-        roi_bx, 
+        rpn_anchor_targets,
+        roi_anchor_targets,
+        rpn_bxs, 
+        rpn_targets, 
+        roi_bxs, 
         roi_targets, 
-        roi, 
+        rois, 
         roi_idx
     ):
         """ Function computes the loss for Faster RCNN Model
@@ -61,21 +85,46 @@ class FasterRCNN(nn.Module):
                         'rpn_target_loss',
                         'roi_bx_loss',
                         'roi_target_loss'
+
             torch.Tensor: sum of losses used for backpropogation
         """
         # TODO: Save roi indexes so anchor_targets only can be passed
-        rpn_bx_loss = F.smooth_l1_loss(rpn_bx[0][anchor_targets>0], anchors[anchor_targets>0])
-        rpn_target_loss = F.cross_entropy(rpn_target[0], anchor_targets, ignore_index=-1)
+        rpn_bx_loss = F.smooth_l1_loss(rpn_bxs[0][rpn_anchor_targets>0], anchors[rpn_anchor_targets>0])
+        rpn_target_loss = F.cross_entropy(rpn_targets[0], rpn_anchor_targets, ignore_index=-1)
 
-        roi_bx_loss = F.smooth_l1_loss(roi_bx, roi)
-        roi_target_loss = F.cross_entropy(roi_targets, anchor_targets[roi_idx], ignore_index=-1)
+        print(roi_bxs.shape, rois.shape)
+        roi_bx_loss = F.smooth_l1_loss(roi_bxs, rois)
+        # TODO: Ensure correct targets are being compared (true_targets)
+        roi_target_loss = F.cross_entropy(roi_targets, roi_anchor_targets[roi_idx], ignore_index=-1)
         
         losses = [rpn_bx_loss, rpn_target_loss, roi_bx_loss, roi_target_loss]
         return FasterRCNN.Loss(*losses), sum(losses)
 
     def forward(self, image_list, true_bx=None, true_targets=None):
+        """ Forward pass over model
+
+        Args:
+            image_list (torch.Tensor): input images (b, c, w, h)
+            true_bx (torch.Tensor): input images' true bounding boxes
+            true_targets (torch.Tensor): input images' true class targets
+        
+        Returns:
+            if training
+                namedtuple: output loss tuple  with idx names:        
+                        'rpn_bx_loss',
+                        'rpn_target_loss',
+                        'roi_bx_loss',
+                        'roi_target_loss'
+
+                torch.Tensor: sum of losses used for backpropogation
+            
+            if testing
+                roi_bxs (torch.Tensor): (n,4) region boxes 
+                roi_targets (torch.Tensor): (n, 4) class prediction targets
+                    for rois
+        """
         features = self._feature_extractor(image_list)
-        rpn_bxs, rpn_targets = self._rpn(image_list, features)
+        rpn_bxs, rpn_targets = self._rpn(features)
         anchors = self.anchor.generate_anchor_mesh(
             image_list, 
             features,
@@ -87,13 +136,16 @@ class FasterRCNN(nn.Module):
         roi_bxs, roi_targets = self._rcnn(features, rois)
 
         if self.training:
-            anchor_targets = self.anchor.generate_anchor_targets(
+            rpn_anchor_targets, roi_anchor_targets = self.anchor.generate_anchor_targets(
                 anchors,
-                true_bx
+                true_bx,
+                true_targets
             )
+
             return self.loss_func(        
                 anchors, 
-                anchor_targets, 
+                rpn_anchor_targets, 
+                roi_anchor_targets,
                 rpn_bxs, 
                 rpn_targets, 
                 roi_bxs, 
@@ -105,10 +157,16 @@ class FasterRCNN(nn.Module):
             return roi_bxs, roi_targets
 
 
-class Backbone(nn.Module):
-    def __init__(self, pretrained=True, fpn=False):
+class FeatureExtractor(nn.Module):
+    """ Class used for feature extraction
+
+    Args:
+        pretrained (bool): used pretained model if True
+                        else don't    
+    """
+    def __init__(self, pretrained=True):
         super().__init__()
-        self.fpn = fpn
+        # TODO: Allow for different backbones
         if pretrained:
             self._layers = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1).features[:30]
             for param in self._layers.parameters():
@@ -120,34 +178,53 @@ class Backbone(nn.Module):
         """ Class is feature extractor backbone using vgg16
         Args:
             x (torch.Tensor): input image
+        
+        Returns:
+            torch.Tensor: extracted features from input images
         """
         x = self._layers(x)
         return x
 
 
-class RPN(nn.Module):
-    def __init__(self):
+class RegionProposalNetwork(nn.Module):
+    """ Class used to map extracted features to image space using anchors """
+    def __init__(self, n_classes):
         super().__init__()
         # TODO: Init weights?
+        self.n_classes = n_classes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         n_anchors = 9
-        # self.rpn_batch_size = 256
-        # self.anchor = Anchor(n_anchors)
         self._conv = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3,3), stride=1, padding="same")
-        self._target = nn.Conv2d(in_channels=512, out_channels=n_anchors*2, kernel_size=(1,1), stride=1, padding=0)
+        self._target = nn.Conv2d(in_channels=512, out_channels=n_anchors*self.n_classes, kernel_size=(1,1), stride=1, padding=0)
         self._bbx = nn.Conv2d(in_channels=512, out_channels=n_anchors*4, kernel_size=(1,1), stride=1, padding=0)
 
-    def forward(self, images, features):
+    def forward(self, features):
+        """ Forward pass of RPN
+
+        Args:
+            features (torch.Tensor): extracted features
+        
+        Returns:
+            torch.Tensor: bounding boxes (n, 4)
+            torch.Tensor: predicted targets (fg/bg)
+        """
         x = F.relu(self._conv(features))
         target = self._target(x).permute(0, 2, 3, 1).contiguous()
-        # Scores: (batch_size, feature_size, 2)
-        # Proposal Boxes: (batch_size, feature_size, 4)
-        target = F.softmax(target.view(features.shape[0], -1, 2), dim=2)
+        target = F.softmax(target.view(features.shape[0], -1, self.n_classes), dim=2)
         bx = self._bbx(x).permute(0,2,3,1).contiguous().view(features.shape[0],-1,4)
         return bx, target
 
 
 class Anchor:
+    """ Class makes anchors for input image
+
+    Args:
+        n_anchors (int): number of anchors per location
+        anchor_ratios (list): ratio of anchor sizes for each location
+        scales (list): scales of anchors for each location
+        anchor_threshold (list): [upper_threshold, lower_threshold]
+            1 > upper_threshold > lower_threshold > 0    
+    """
     def __init__(self, n_anchors=9, anchor_ratios=[0.5, 1, 2], scales=[8, 16, 32], anchor_threshold=[0.5, 0.1]):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.n_anchors = torch.tensor(n_anchors)
@@ -269,12 +346,31 @@ class Anchor:
 
         return anchors
     
-    def generate_anchor_targets(self, anchors, true_bx):
-        self.anchor_iou = torchvision.ops.box_iou(true_bx.reshape(-1,4), anchors)
-        anchor_targets = torch.full((anchors.shape[0],), -1)
-        anchor_targets[self.anchor_iou[0] >= self.anchor_threshold[0]] = 1
-        anchor_targets[self.anchor_iou[0] <= self.anchor_threshold[1]] = 0
-        return anchor_targets
+    def generate_anchor_targets(self, anchors, true_bx, true_targets):
+        # Anchor targets for all true boxes in image
+        true_targets[1] = 1
+        anchor_iou = torchvision.ops.box_iou(true_bx.reshape(-1,4), anchors) 
+        rpn_anchor_targets = torch.full((anchors.shape[0],), -1)       
+        roi_anchor_targets = torch.full((anchors.shape[0],), -1)
+        fg_bool_anchor_iou = torch.full((anchor_iou.shape[0], anchors.shape[0],), 0)
+        bg_bool_anchor_iou = torch.full((anchor_iou.shape[0], anchors.shape[0],), 0)
+        
+        if anchor_iou.shape[0] <= 1:
+            roi_anchor_targets[anchor_iou[0] >= self.anchor_threshold[0]] = true_targets[0] + 1
+            roi_anchor_targets[anchor_iou[0] <= self.anchor_threshold[1]] = 0
+        else:
+            fg_bool = torch.full((anchors.shape[0],), 0)
+            bg_bool = torch.full((anchors.shape[0],), 1)
+            for i in range(anchor_iou.shape[0]):
+                fg_bool_anchor_iou[i, anchor_iou[i] >= self.anchor_threshold[0]] = true_targets[i] + 1
+                bg_bool_anchor_iou[i, anchor_iou[i] <= self.anchor_threshold[1]] = 1
+                fg_bool = fg_bool | fg_bool_anchor_iou[i]
+                bg_bool = bg_bool & bg_bool_anchor_iou[i]
+
+            roi_anchor_targets[fg_bool>0] = fg_bool[fg_bool>0]
+            roi_anchor_targets[bg_bool>0] = 0
+        rpn_anchor_targets[roi_anchor_targets > 0] = 1
+        return rpn_anchor_targets, roi_anchor_targets
 
     def post_processing(self, anchors, scores):
         # TODO: Fix for batch size > 1
@@ -290,8 +386,7 @@ class Anchor:
 
 
 class RCNN(nn.Module):
-    # TODO: setup rcnn model
-    def __init__(self, pool_size=7, n_classes=1, pretrained=True):
+    def __init__(self, n_classes, pool_size=7, pretrained=True):
         super().__init__()
         self.pool_size = pool_size
         if pretrained:
@@ -300,7 +395,7 @@ class RCNN(nn.Module):
         else:
             mod = torchvision.models.vgg16(weights=None)
             self._layers = nn.Sequential(*[mod.classifier[i] for i in [0,1,3,4]])
-        self._bx = nn.Linear(4096, 4*n_classes)
+        self._bx = nn.Linear(4096, 4) # 4*n_classes ?
         self._target = nn.Linear(4096, n_classes+1)
     
     def forward(self, features, roi):
