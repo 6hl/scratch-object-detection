@@ -1,4 +1,5 @@
 from collections import namedtuple
+from pandas import value_counts
 
 import torch
 import torch.nn as nn
@@ -48,36 +49,37 @@ class FasterRCNN(nn.Module):
         n_anchors = 9
         # TODO: Adjust for different backbone models
         # TODO: adjust for different anchor sizes and shapes
+        self.anchor = Anchor(self, n_anchors)
         self._feature_extractor = FeatureExtractor(pretrained=True)
         self._rpn = RegionProposalNetwork(n_classes=n_classes)
-        self._rcnn = RCNN(n_classes=n_classes)
+        self._rcnn = RCNN(self, n_classes=n_classes)
         n_anchors = 9
         self.rpn_batch_size = 256
-        self.anchor = Anchor(n_anchors)
 
     def loss_func(
         self, 
-        anchors, 
-        rpn_anchor_targets,
-        roi_anchor_targets,
+        true_rpn_bxs, 
+        true_rpn_targets, 
+        rpn_idxs,
         rpn_bxs, 
-        rpn_targets, 
+        rpn_targets,
         roi_bxs, 
         roi_targets, 
-        rois, 
-        roi_idx
+        true_roi_bxs, 
+        true_roi_targets
     ):
         """ Function computes the loss for Faster RCNN Model
 
         Args:
-            anchors (tensor.Tensor): image created anchors
-            anchor_targets (tensor.Tensor): Generated targets from threshold
-            rpn_bx (tensor.Tensor): rpn output bounding box coordinates (N, 4) in (x1,y1,x2,y2)
-            rpn_target (tensor.Tensor): rpn target predictions in softmax format (N, C)
-            roi_bx (tensor.Tensor): rpn output bounding box coordinates (N, 4) in (x1,y1,x2,y2)
-            roi_target (tensor.Tensor): rpn target predictions in softmax format (N, C)
-            rois (tensor.Tensor): roi tensor with highest probability foreground anchors
-            roi_idx (tensor.Tensor): roi indices from anchors
+            rpn_idxs (tensor.Tensor): RPN idxs
+            rpn_bxs (tensor.Tensor): RPN model output delta boxes
+            rpn_targets (tensor.Tensor): RPN model output targets
+            true_rpn_bxs (tensor.Tensor): True delta boxes for RPN
+            true_rpn_targets (tensor.Tensor): True targets for RPN
+            roi_bxs (tensor.Tensor): ROI output delta boxes
+            roi_targets (tensor.Tensor): ROI output targets
+            true_roi_bxs (tensor.Tensor): True ROI delta boxes
+            true_roi_targets (tensor.Tensor): True ROI targets
 
         Returns:
             namedtuple: output loss tuple  with idx names:        
@@ -88,15 +90,10 @@ class FasterRCNN(nn.Module):
 
             torch.Tensor: sum of losses used for backpropogation
         """
-        # TODO: Save roi indexes so anchor_targets only can be passed
-        rpn_bx_loss = F.smooth_l1_loss(rpn_bxs[0][rpn_anchor_targets>0], anchors[rpn_anchor_targets>0])
-        rpn_target_loss = F.cross_entropy(rpn_targets[0], rpn_anchor_targets, ignore_index=-1)
-
-        print(roi_bxs.shape, rois.shape)
-        roi_bx_loss = F.smooth_l1_loss(roi_bxs, rois)
-        # TODO: Ensure correct targets are being compared (true_targets)
-        roi_target_loss = F.cross_entropy(roi_targets, roi_anchor_targets[roi_idx], ignore_index=-1)
-        
+        rpn_bx_loss = F.smooth_l1_loss(rpn_bxs[0][rpn_idxs], true_rpn_bxs)
+        rpn_target_loss = F.cross_entropy(rpn_targets[0][rpn_idxs], true_rpn_targets, ignore_index=-1)
+        roi_bx_loss = F.smooth_l1_loss(roi_bxs, true_roi_bxs)
+        roi_target_loss = F.cross_entropy(roi_targets, true_roi_targets, ignore_index=-1)
         losses = [rpn_bx_loss, rpn_target_loss, roi_bx_loss, roi_target_loss]
         return FasterRCNN.Loss(*losses), sum(losses)
 
@@ -124,37 +121,39 @@ class FasterRCNN(nn.Module):
                     for rois
         """
         features = self._feature_extractor(image_list)
-        rpn_bxs, rpn_targets = self._rpn(features)
+        rpn_delta, rpn_targets = self._rpn(features)
         anchors = self.anchor.generate_anchor_mesh(
             image_list, 
             features,
         )
-        rois, roi_idx = self.anchor.post_processing(
-            anchors,
-            rpn_targets
-        )
-        roi_bxs, roi_targets = self._rcnn(features, rois)
 
+        batch_rois, true_roi_delta, true_roi_targets = self.anchor.generate_roi(
+            anchors,
+            rpn_delta,
+            rpn_targets,
+            true_bx,
+            image_list.shape
+        )
+        roi_delta, roi_targets = self._rcnn(features, batch_rois)
         if self.training:
-            rpn_anchor_targets, roi_anchor_targets = self.anchor.generate_anchor_targets(
+            true_rpn_delta, true_rpn_targets, rpn_idxs = self.anchor.generate_rpn_targets(
                 anchors,
                 true_bx,
-                true_targets
             )
-
-            return self.loss_func(        
-                anchors, 
-                rpn_anchor_targets, 
-                roi_anchor_targets,
-                rpn_bxs, 
-                rpn_targets, 
-                roi_bxs, 
+            return self.loss_func(
+                true_rpn_delta, 
+                true_rpn_targets, 
+                rpn_idxs,
+                rpn_delta, 
+                rpn_targets,
+                roi_delta, 
                 roi_targets, 
-                rois,
-                roi_idx
+                true_roi_delta, 
+                true_roi_targets
             )
         else:
-            return roi_bxs, roi_targets
+            # TODO: adjust output to be unparameterized boxes from single class
+            return roi_delta, roi_targets
 
 
 class FeatureExtractor(nn.Module):
@@ -195,8 +194,8 @@ class RegionProposalNetwork(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         n_anchors = 9
         self._conv = nn.Conv2d(in_channels=512, out_channels=512, kernel_size=(3,3), stride=1, padding="same")
-        self._target = nn.Conv2d(in_channels=512, out_channels=n_anchors*self.n_classes, kernel_size=(1,1), stride=1, padding=0)
-        self._bbx = nn.Conv2d(in_channels=512, out_channels=n_anchors*4, kernel_size=(1,1), stride=1, padding=0)
+        self._target = nn.Conv2d(in_channels=512, out_channels=n_anchors*2, kernel_size=(1,1), stride=1, padding=0)
+        self._delta = nn.Conv2d(in_channels=512, out_channels=n_anchors*4, kernel_size=(1,1), stride=1, padding=0)
 
     def forward(self, features):
         """ Forward pass of RPN
@@ -205,14 +204,14 @@ class RegionProposalNetwork(nn.Module):
             features (torch.Tensor): extracted features
         
         Returns:
-            torch.Tensor: bounding boxes (n, 4)
+            torch.Tensor: bounding deltas (n, 4)
             torch.Tensor: predicted targets (fg/bg)
         """
         x = F.relu(self._conv(features))
         target = self._target(x).permute(0, 2, 3, 1).contiguous()
-        target = F.softmax(target.view(features.shape[0], -1, self.n_classes), dim=2)
-        bx = self._bbx(x).permute(0,2,3,1).contiguous().view(features.shape[0],-1,4)
-        return bx, target
+        target = F.softmax(target.view(features.shape[0], -1, 2), dim=2)
+        delta = self._delta(x).permute(0,2,3,1).contiguous().view(features.shape[0],-1,4)
+        return delta, target
 
 
 class Anchor:
@@ -225,14 +224,25 @@ class Anchor:
         anchor_threshold (list): [upper_threshold, lower_threshold]
             1 > upper_threshold > lower_threshold > 0    
     """
-    def __init__(self, n_anchors=9, anchor_ratios=[0.5, 1, 2], scales=[8, 16, 32], anchor_threshold=[0.5, 0.1]):
+    def __init__(self,
+            model,
+            n_anchors=9, 
+            anchor_ratios=[0.5, 1, 2], 
+            scales=[8, 16, 32], 
+            anchor_threshold=[0.5, 0.1], 
+            batch_size=[256, 64]
+        ):
+        self.model = model
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.n_anchors = torch.tensor(n_anchors)
         self.anchor_ratios = torch.tensor(anchor_ratios)
         self.anchor_threshold = anchor_threshold
         self.scales = torch.tensor(scales)
         self.border = 0
-        self.nms_filter = 2000
+        self.train_nms_filter = [12000, 2000]
+        self.test_nms_filter = [6000, 300]
+        self.batch_size = batch_size
+        self.roi_anchor_threshold = [0.5, 0.0]
     
     def _ratio_anchors(self, base_anchor, ratios):
         """Helper function to generate ratio anchors
@@ -242,7 +252,7 @@ class Anchor:
         Returns:
             torch.Tensor: bounding boxes (len(ratios), 4)
         """
-        yolo_anchor = self._voc_to_yolo(base_anchor)
+        yolo_anchor = self._voc_to_yolo(base_anchor.reshape(-1,4))[0]
         wr = torch.round(torch.sqrt(yolo_anchor[2]*yolo_anchor[3]/ratios))
         hr = torch.round(wr*ratios)
         return self._anchor_set(
@@ -271,7 +281,7 @@ class Anchor:
             dim=1
         ) 
 
-    # TODO: Remove for torch.ops.box_convert
+    # TODO: Remove for torchvision.ops.box_convert
     def _voc_to_yolo(self, bbx):
         """Helper function that returns yolo labeling for bounding box
         Args:
@@ -279,13 +289,13 @@ class Anchor:
         Returns:
             torch.Tensor: (x_center, y_center, width, height)
         """
-        return torch.tensor(
+        return torch.stack(
             (
-                bbx[0] + 0.5*(bbx[3]-1), 
-                bbx[1] + 0.5*(bbx[2]-1), 
-                bbx[3] - bbx[1] + 1,
-                bbx[2] - bbx[0] + 1
-            )
+                bbx[:, 0] + 0.5*(bbx[:, 3]-1), 
+                bbx[:, 1] + 0.5*(bbx[:, 2]-1), 
+                bbx[:, 3] - bbx[:, 1] + 1,
+                bbx[:, 2] - bbx[:, 0] + 1
+            ), dim=1
         )
 
     def _scale_ratio_anchors(self, anchor, scales):
@@ -294,7 +304,7 @@ class Anchor:
             anchor (torch.Tensor): (x_center, y_center, width, height)
             scales (torch.Tensor): scales for anchors
         """
-        yolo_anchor = self._voc_to_yolo(anchor)
+        yolo_anchor = self._voc_to_yolo(anchor.reshape(-1,4))[0]
         return self._anchor_set(
             [
                 yolo_anchor[0], 
@@ -304,6 +314,43 @@ class Anchor:
             ]
         )
 
+    def _parameterize(self, source_bxs, dst):
+        """
+        bx_list: [predicted_bxs, ground_truth]
+        all inputs (N, 4), x,y,w,h
+                           0,1,2,3
+        """
+        source_bxs = torchvision.ops.box_convert(source_bxs, in_fmt="xyxy", out_fmt="cxcywh")
+        dst = torchvision.ops.box_convert(dst, in_fmt="xyxy", out_fmt="cxcywh")
+        return torch.stack(
+            (
+                (source_bxs[:,0] - dst[:,0]) / dst[:, 2],
+                (source_bxs[:,1] - dst[:,1])/ dst[:, 3],
+                torch.log(source_bxs[:,2]/dst[:,2]),
+                torch.log(source_bxs[:,3]/dst[:,3])
+            ), dim=1
+        ).to(torch.float64)
+    
+    def _unparameterize(self, source_bxs, deltas):
+        """
+        source_bxs : (n,4) xyxy
+        deltas: delta_x, delta_y, delta_w, delta_h
+        
+        """
+        source_bxs = torchvision.ops.box_convert(source_bxs, in_fmt="xyxy", out_fmt="cxcywh")
+        return torchvision.ops.box_convert(
+            torch.stack(
+                (
+                    deltas[:, 0] * source_bxs[:, 2] + source_bxs[:, 0],
+                    deltas[:, 1] * source_bxs[:, 3] + source_bxs[:, 1],
+                    torch.exp(deltas[:, 2]) * source_bxs[:, 2],
+                    torch.exp(deltas[:, 3]) * source_bxs[:, 3]
+                ), dim=1
+            ),
+            in_fmt="cxcywh",
+            out_fmt="xyxy"
+        ).to(torch.float64)
+ 
     # TODO: Make anchor script dynamically adjust scales if needed
     def generate_anchor_mesh(self, images, feature_maps):
         """Function generates anchor maps for given image and feature maps
@@ -346,47 +393,94 @@ class Anchor:
 
         return anchors
     
-    def generate_anchor_targets(self, anchors, true_bx, true_targets):
-        # Anchor targets for all true boxes in image
-        true_targets[1] = 1
-        anchor_iou = torchvision.ops.box_iou(true_bx.reshape(-1,4), anchors) 
-        rpn_anchor_targets = torch.full((anchors.shape[0],), -1)       
-        roi_anchor_targets = torch.full((anchors.shape[0],), -1)
-        fg_bool_anchor_iou = torch.full((anchor_iou.shape[0], anchors.shape[0],), 0)
-        bg_bool_anchor_iou = torch.full((anchor_iou.shape[0], anchors.shape[0],), 0)
+    def generate_rpn_targets(self, anchors, true_bx):
+        true_bx = true_bx.reshape(-1,4)
+        anchor_iou = torchvision.ops.box_iou(true_bx, anchors)
+        max_values, max_idx = anchor_iou.max(dim=0)
+        true_anchor_bxs = torch.stack(
+            [true_bx[m.item()] for m in max_idx],
+            dim=0
+        )
+
+        # Find fg/bg anchor idx
+        fg_idx = (max_values >= self.anchor_threshold[0]).nonzero().ravel()
+        bg_idx = (max_values <= self.anchor_threshold[1]).nonzero().ravel()
+        bg_bool = True if len(bg_idx) <= int(self.batch_size[0]/2) else False
+
+        # Create batch from fg/bg idx
+        fg_idx = fg_idx[
+            torch.ones(len(fg_idx)).multinomial(
+                min(int(self.batch_size[0]/2), len(fg_idx)),
+                replacement=False)
+            ]
+        bg_idx = bg_idx[
+            torch.ones(len(bg_idx)).multinomial(
+                self.batch_size[0]-len(fg_idx),
+                replacement=bg_bool)
+            ]
         
-        if anchor_iou.shape[0] <= 1:
-            roi_anchor_targets[anchor_iou[0] >= self.anchor_threshold[0]] = true_targets[0] + 1
-            roi_anchor_targets[anchor_iou[0] <= self.anchor_threshold[1]] = 0
-        else:
-            fg_bool = torch.full((anchors.shape[0],), 0)
-            bg_bool = torch.full((anchors.shape[0],), 1)
-            for i in range(anchor_iou.shape[0]):
-                fg_bool_anchor_iou[i, anchor_iou[i] >= self.anchor_threshold[0]] = true_targets[i] + 1
-                bg_bool_anchor_iou[i, anchor_iou[i] <= self.anchor_threshold[1]] = 1
-                fg_bool = fg_bool | fg_bool_anchor_iou[i]
-                bg_bool = bg_bool & bg_bool_anchor_iou[i]
+        rpn_anchor_idx = torch.cat((fg_idx, bg_idx), dim=0)
+        true_rpn_targets = torch.tensor([1]*len(fg_idx) + [0]*len(bg_idx))
+        true_rpn_delta = self._parameterize(anchors[rpn_anchor_idx, :], true_anchor_bxs[rpn_anchor_idx, :])
+        return true_rpn_delta, true_rpn_targets, rpn_anchor_idx
 
-            roi_anchor_targets[fg_bool>0] = fg_bool[fg_bool>0]
-            roi_anchor_targets[bg_bool>0] = 0
-        rpn_anchor_targets[roi_anchor_targets > 0] = 1
-        return rpn_anchor_targets, roi_anchor_targets
-
-    def post_processing(self, anchors, scores):
+    def generate_roi(self, anchors, rpn_bxs, rpn_targets, true_bx, img_shape):
         # TODO: Fix for batch size > 1
         # TODO: Ensure GPU support
-        scores = scores.detach().view(-1, 2)[:, 1]
-        top_scores_idx = scores.argsort()
-        top_anchors = anchors[top_scores_idx].to(torch.float64)
-        top_scores = anchors[top_scores_idx][:, 1].to(torch.float64)
-        nms_idx = torchvision.ops.nms(top_anchors, top_scores, iou_threshold=0.6)
-        if self.nms_filter:
-            nms_idx = nms_idx[:self.nms_filter]
-        return anchors[nms_idx], nms_idx
+        if self.model.training:
+            nms_filter = self.train_nms_filter
+        else:
+            nms_filter = self.test_nms_filter
+
+        rpn_un_param = self._unparameterize(anchors, rpn_bxs[0].clone().detach())
+        rpn_anchors = torchvision.ops.clip_boxes_to_image(rpn_un_param, (img_shape[2], img_shape[3]))
+        rpn_anchor_idx = torchvision.ops.remove_small_boxes(rpn_anchors, 16.0)
+        rpn_anchors = rpn_anchors[rpn_anchor_idx, :]
+        rpn_targets = rpn_targets[0][rpn_anchor_idx].clone().detach().view(-1, 2)[:,1]
+
+        top_scores_idx = rpn_targets.argsort()[:nms_filter[0]]
+        rpn_anchors = rpn_anchors[top_scores_idx, :].to(torch.float64)
+        rpn_targets = rpn_targets[top_scores_idx].to(torch.float64)
+
+        nms_idx = torchvision.ops.nms(rpn_anchors, rpn_targets, iou_threshold=0.7)
+        nms_idx = nms_idx[:nms_filter[1]]
+        rpn_anchors = rpn_anchors[nms_idx, :]
+        rpn_targets = rpn_targets[nms_idx]
+
+        # Post processing fix below ==================
+
+        anchor_iou = torchvision.ops.box_iou(true_bx.reshape(-1,4), rpn_anchors)
+        rpn_anchor_targets = torch.full((anchors.shape[0],), -1)
+        max_values, max_idx = anchor_iou.max(dim=0)
+        
+        # Find fg/bg anchor idx
+        fg_idx = (max_values >= self.anchor_threshold[0]).nonzero().ravel()
+        bg_idx = ((max_values < self.roi_anchor_threshold[0]) &
+                (max_values >= self.roi_anchor_threshold[1])).nonzero().ravel()
+
+        # Create batch from fg/bg idx, consider repeated values
+        fg_idx = fg_idx[
+            torch.ones(len(fg_idx)).multinomial(
+                min(int(self.batch_size[0]/2), len(fg_idx)), 
+                replacement=False
+            )
+        ]
+        bg_idx = bg_idx[
+            torch.ones(len(bg_idx)).multinomial(
+                self.batch_size[0]-len(fg_idx), 
+                replacement=True if len(bg_idx) <= self.batch_size[0]-len(fg_idx) else False
+            )
+        ]
+        
+        batch_rpn_idx = torch.cat((fg_idx, bg_idx), dim=0)
+        batch_roi = rpn_anchors[batch_rpn_idx]
+        true_roi_targets = max_idx[batch_rpn_idx]
+        true_roi_delta = self._parameterize(batch_roi, anchors[batch_rpn_idx])
+        return batch_roi, true_roi_delta, true_roi_targets
 
 
 class RCNN(nn.Module):
-    def __init__(self, n_classes, pool_size=7, pretrained=True):
+    def __init__(self, model, n_classes, pool_size=7, pretrained=True):
         super().__init__()
         self.pool_size = pool_size
         if pretrained:
@@ -395,18 +489,27 @@ class RCNN(nn.Module):
         else:
             mod = torchvision.models.vgg16(weights=None)
             self._layers = nn.Sequential(*[mod.classifier[i] for i in [0,1,3,4]])
-        self._bx = nn.Linear(4096, 4) # 4*n_classes ?
+        self._delta = nn.Linear(4096, 4*(n_classes+1))
         self._target = nn.Linear(4096, n_classes+1)
     
+    def _post_process(self, onehot_delta, targets):
+        max_values, max_idx = targets.max(dim=1)
+        delta = torch.stack(
+            [bx[idx*4:idx*4+4] for bx, idx in zip(onehot_delta, max_idx)],
+            dim=0
+        )
+        return delta
+
     def forward(self, features, roi):
         # TODO: adjust roi for batch data list of batch rois
         pooled_features = torchvision.ops.roi_pool(
-            features, 
-            [roi], 
+            features.float(), 
+            [roi.float()], 
             output_size=(self.pool_size, self.pool_size)
         )
         pooled_features = pooled_features.view(pooled_features.shape[0], -1)
         x = self._layers(pooled_features)
-        bx = self._bx(x)
+        onehot_delta = self._delta(x)
         targets = F.softmax(self._target(x), dim=1)
-        return bx, targets
+        delta = self._post_process(onehot_delta, targets)
+        return delta, targets
