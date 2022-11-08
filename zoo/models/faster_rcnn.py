@@ -1,5 +1,4 @@
 from collections import namedtuple
-from pandas import value_counts
 
 import torch
 import torch.nn as nn
@@ -132,7 +131,8 @@ class FasterRCNN(nn.Module):
             rpn_delta,
             rpn_targets,
             true_bx,
-            image_list.shape
+            true_targets,
+            image_list.shape,
         )
         roi_delta, roi_targets = self._rcnn(features, batch_rois)
         if self.training:
@@ -224,14 +224,15 @@ class Anchor:
         anchor_threshold (list): [upper_threshold, lower_threshold]
             1 > upper_threshold > lower_threshold > 0    
     """
-    def __init__(self,
-            model,
-            n_anchors=9, 
-            anchor_ratios=[0.5, 1, 2], 
-            scales=[8, 16, 32], 
-            anchor_threshold=[0.5, 0.1], 
-            batch_size=[256, 64]
-        ):
+    def __init__(
+        self,
+        model,
+        n_anchors=9, 
+        anchor_ratios=[0.5, 1, 2], 
+        scales=[8, 16, 32], 
+        anchor_threshold=[0.5, 0.1], 
+        batch_size=[256, 64],
+    ):
         self.model = model
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.n_anchors = torch.tensor(n_anchors)
@@ -408,11 +409,12 @@ class Anchor:
         bg_bool = True if len(bg_idx) <= int(self.batch_size[0]/2) else False
 
         # Create batch from fg/bg idx
-        fg_idx = fg_idx[
-            torch.ones(len(fg_idx)).multinomial(
-                min(int(self.batch_size[0]/2), len(fg_idx)),
-                replacement=False)
-            ]
+        if len(fg_idx) > 0:
+            fg_idx = fg_idx[
+                torch.ones(len(fg_idx)).multinomial(
+                    min(int(self.batch_size[0]/2), len(fg_idx)),
+                    replacement=False)
+                ]
         bg_idx = bg_idx[
             torch.ones(len(bg_idx)).multinomial(
                 self.batch_size[0]-len(fg_idx),
@@ -424,8 +426,7 @@ class Anchor:
         true_rpn_delta = self._parameterize(anchors[rpn_anchor_idx, :], true_anchor_bxs[rpn_anchor_idx, :])
         return true_rpn_delta, true_rpn_targets, rpn_anchor_idx
 
-    def generate_roi(self, anchors, rpn_bxs, rpn_targets, true_bx, img_shape):
-        # TODO: Fix for batch size > 1
+    def generate_roi(self, anchors, rpn_bxs, rpn_targets, true_bx, true_targets, img_shape):
         # TODO: Ensure GPU support
         if self.model.training:
             nms_filter = self.train_nms_filter
@@ -447,11 +448,9 @@ class Anchor:
         rpn_anchors = rpn_anchors[nms_idx, :]
         rpn_targets = rpn_targets[nms_idx]
 
-        # Post processing fix below ==================
-
         anchor_iou = torchvision.ops.box_iou(true_bx.reshape(-1,4), rpn_anchors)
-        rpn_anchor_targets = torch.full((anchors.shape[0],), -1)
         max_values, max_idx = anchor_iou.max(dim=0)
+        true_roi_targets = torch.zeros(self.batch_size)
         
         # Find fg/bg anchor idx
         fg_idx = (max_values >= self.anchor_threshold[0]).nonzero().ravel()
@@ -459,12 +458,13 @@ class Anchor:
                 (max_values >= self.roi_anchor_threshold[1])).nonzero().ravel()
 
         # Create batch from fg/bg idx, consider repeated values
-        fg_idx = fg_idx[
-            torch.ones(len(fg_idx)).multinomial(
-                min(int(self.batch_size[0]/2), len(fg_idx)), 
-                replacement=False
-            )
-        ]
+        if len(fg_idx) > 0:
+            fg_idx = fg_idx[
+                torch.ones(len(fg_idx)).multinomial(
+                    min(int(self.batch_size[0]/2), len(fg_idx)), 
+                    replacement=False
+                )
+            ]
         bg_idx = bg_idx[
             torch.ones(len(bg_idx)).multinomial(
                 self.batch_size[0]-len(fg_idx), 
@@ -474,7 +474,7 @@ class Anchor:
         
         batch_rpn_idx = torch.cat((fg_idx, bg_idx), dim=0)
         batch_roi = rpn_anchors[batch_rpn_idx]
-        true_roi_targets = max_idx[batch_rpn_idx]
+        true_roi_targets = torch.cat((true_targets[max_idx[fg_idx]], torch.zeros(len(bg_idx)))).long()
         true_roi_delta = self._parameterize(batch_roi, anchors[batch_rpn_idx])
         return batch_roi, true_roi_delta, true_roi_targets
 
