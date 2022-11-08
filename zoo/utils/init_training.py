@@ -1,8 +1,10 @@
-from zoo.models import rcnn
+from zoo.models import rcnn, faster_rcnn
+from zoo.utils import trainer
 
-MODELS = {
-    "rcnn": rcnn.RCNN
+TRAINER = {
+    "rcnn": rcnn.RCNN,
+    "fasterrcnn": trainer.FRCNNTrainer, 
 }
 
-def init_training(args):
-    return MODELS[args["model"]](**args)
+def init_training(kwargs):
+    return TRAINER[kwargs["model"]](**kwargs)
